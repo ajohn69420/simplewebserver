@@ -182,6 +182,7 @@ void respond(int n)
         fflush(stdout);
         shutdown(STDOUT_FILENO, SHUT_WR);
         close(STDOUT_FILENO);
+        free(buf);
     }
 
     //Closing SOCKET
