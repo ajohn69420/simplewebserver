@@ -1,16 +1,15 @@
 #include "httpd.h"
 
+#include <winsock2.h>
+#include <windows.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <fcntl.h>
-#include <signal.h>
+#include <process.h> // For _beginthreadex and _endthreadex
+#include <ws2tcpip.h>
+
+
+#pragma comment(lib, "ws2_32.lib") // Link with ws2_32.lib
 
 #define CONNMAX 1000
 
@@ -22,102 +21,117 @@ char* method,    // "GET" or "POST"
 char* payload;     // for POST
 int      payload_size;
 
-static int listenfd, clients[CONNMAX];
-static void error(char *);
+static SOCKET listenfd, clients[CONNMAX];
+static void error(const char *);
 static void startServer(const char *);
-static void respond(int);
+static unsigned int __stdcall respond(void *arg);
 
 typedef struct { char *name, *value; } header_t;
 static header_t reqhdr[17] = { {"\0", "\0"} };
-static int clientfd;
+static SOCKET clientfd;
 
 static char *buf;
 
+
 void serve_forever(const char *PORT)
 {
-    struct sockaddr_in clientaddr;
-    socklen_t addrlen;
-    char c;    
-    
-    int slot=0;
-    
-    printf(
-            "Server started %shttp://127.0.0.1:%s%s\n",
-            "\033[92m",PORT,"\033[0m"
-            );
+    SOCKADDR_IN clientaddr;
+    int addrlen = sizeof(clientaddr);
+    int slot = 0;
+    HANDLE threadHandles[CONNMAX];
+    DWORD threadIDs[CONNMAX];
 
-    // Setting all elements to -1: signifies there is no client connected
+    printf("Server started http://127.0.0.1:%s\n", PORT);
+
+    // Setting all elements to INVALID_SOCKET: signifies there is no client connected
     int i;
-    for (i=0; i<CONNMAX; i++)
-        clients[i]=-1;
+    for (i = 0; i < CONNMAX; i++)
+        clients[i] = INVALID_SOCKET;
+
     startServer(PORT);
-    
-    // Ignore SIGCHLD to avoid zombie threads
-    signal(SIGCHLD,SIG_IGN);
 
     // ACCEPT connections
     while (1)
     {
-        addrlen = sizeof(clientaddr);
-        clients[slot] = accept (listenfd, (struct sockaddr *) &clientaddr, &addrlen);
-
-        if (clients[slot]<0)
+        clients[slot] = accept(listenfd, (SOCKADDR *)&clientaddr, &addrlen);
+        if (clients[slot] == INVALID_SOCKET)
         {
-            perror("accept() error");
+            printf("accept() error\n");
         }
         else
         {
-            if ( fork()==0 )
+            // Create a new thread to handle the connection
+            threadHandles[slot] = (HANDLE)_beginthreadex(NULL, 0, respond, (void*)clients[slot], 0, (unsigned int*)&threadIDs[slot]);
+            if (threadHandles[slot] == NULL)
             {
-                respond(slot);
-                exit(0);
+                printf("Failed to create thread\n");
             }
         }
 
-        while (clients[slot]!=-1) slot = (slot+1)%CONNMAX;
+        while (clients[slot] != INVALID_SOCKET) slot = (slot + 1) % CONNMAX;
     }
+
+    // Cleanup
+    for (i = 0; i < CONNMAX; i++)
+    {
+        if (threadHandles[i] != NULL)
+        {
+            WaitForSingleObject(threadHandles[i], INFINITE);
+            CloseHandle(threadHandles[i]);
+        }
+    }
+    closesocket(listenfd);
+    WSACleanup();
 }
 
-//start server
+// Start server
 void startServer(const char *port)
 {
+    WSADATA wsaData;
     struct addrinfo hints, *res, *p;
+    int option = 1;
+
+    // Initialize Winsock
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+    {
+        printf("WSAStartup failed\n");
+        exit(1);
+    }
 
     // getaddrinfo for host
-    memset (&hints, 0, sizeof(hints));
+    memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
-    if (getaddrinfo( NULL, port, &hints, &res) != 0)
+    if (getaddrinfo(NULL, port, &hints, &res) != 0)
     {
-        perror ("getaddrinfo() error");
+        printf("getaddrinfo() error\n");
         exit(1);
     }
     // socket and bind
-    for (p = res; p!=NULL; p=p->ai_next)
+    for (p = res; p != NULL; p = p->ai_next)
     {
-        int option = 1;
-        listenfd = socket (p->ai_family, p->ai_socktype, 0);
-        setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
-        if (listenfd == -1) continue;
-        if (bind(listenfd, p->ai_addr, p->ai_addrlen) == 0) break;
+        listenfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (listenfd == INVALID_SOCKET) continue;
+        if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&option, sizeof(option)) == SOCKET_ERROR) continue;
+        if (bind(listenfd, p->ai_addr, (int)p->ai_addrlen) == SOCKET_ERROR) continue;
+        break;
     }
-    if (p==NULL)
+    if (p == NULL)
     {
-        perror ("socket() or bind()");
+        printf("socket() or bind() error\n");
         exit(1);
     }
 
     freeaddrinfo(res);
 
     // listen for incoming connections
-    if ( listen (listenfd, 1000000) != 0 )
+    if (listen(listenfd, SOMAXCONN) == SOCKET_ERROR)
     {
-        perror("listen() error");
+        printf("listen() error\n");
         exit(1);
     }
 }
-
 
 // get request header
 char *request_header(const char* name)
@@ -131,28 +145,29 @@ char *request_header(const char* name)
 }
 
 //client connection
-void respond(int n)
+unsigned int __stdcall respond(void *arg)
 {
-    int rcvd, fd, bytes_read;
+    SOCKET clientSocket = (SOCKET)arg;
+    int rcvd;
     char *ptr;
 
-    buf = malloc(65535);
-    rcvd=recv(clients[n], buf, 65535, 0);
+    buf = (char *)malloc(65535);
+    rcvd = recv(clientSocket, buf, 65535, 0);
 
-    if (rcvd<0)    // receive error
-        fprintf(stderr,("recv() error\n"));
-    else if (rcvd==0)    // receive socket closed
-        fprintf(stderr,"Client disconnected upexpectedly.\n");
+    if (rcvd == SOCKET_ERROR)    // receive error
+        printf("recv() error\n");
+    else if (rcvd == 0)    // receive socket closed
+        printf("Client disconnected unexpectedly.\n");
     else    // message received
     {
         buf[rcvd] = '\0';
 
-        method = strtok(buf,  " \t\r\n");
+        method = strtok(buf, " \t\r\n");
         uri    = strtok(NULL, " \t");
-        prot   = strtok(NULL, " \t\r\n"); 
+        prot   = strtok(NULL, " \t\r\n");
 
-        fprintf(stderr, "\x1b[32m + [%s] %s\x1b[0m\n", method, uri);
-        
+        printf(" + [%s] %s\n", method, uri);
+
         if (qs = strchr(uri, '?'))
         {
             *qs++ = '\0'; //split URI
@@ -162,39 +177,36 @@ void respond(int n)
 
         header_t *h = reqhdr;
         char *t, *t2;
-        while(h < reqhdr+16) {
-            char *k,*v,*t;
-            k = strtok(NULL, "\r\n: \t"); if (!k) break;
-            v = strtok(NULL, "\r\n");     while(*v && *v==' ') v++;
-            h->name  = k;
+        while (h < reqhdr + 16) {
+            char *k, *v;
+            k = strtok(NULL, "\r\n: \t");
+            if (!k) break;
+            v = strtok(NULL, "\r\n");
+            while (*v && *v == ' ') v++;
+            h->name = k;
             h->value = v;
             h++;
-            fprintf(stderr, "[H] %s: %s\n", k, v);
+            printf("[H] %s: %s\n", k, v);
             t = v + 1 + strlen(v);
             if (t[1] == '\r' && t[2] == '\n') break;
         }
         t++; // now the *t shall be the beginning of user payload
         t2 = request_header("Content-Length"); // and the related header if there is  
         payload = t;
-        payload_size = t2 ? atol(t2) : (rcvd-(t-buf));
+        payload_size = t2 ? atol(t2) : (rcvd - (t - buf));
 
-        // bind clientfd to stdout, making it easier to write
-        clientfd = clients[n];
-        dup2(clientfd, STDOUT_FILENO);
-        close(clientfd);
-
-        // call router
+        // Call router
         route();
 
-        // tidy up
+        // Tidy up
         fflush(stdout);
-        shutdown(STDOUT_FILENO, SHUT_WR);
-        close(STDOUT_FILENO);
+        shutdown(clientSocket, SD_SEND);
+        closesocket(clientSocket);
         free(buf);
     }
 
-    //Closing SOCKET
-    shutdown(clientfd, SHUT_RDWR);         //All further send and recieve operations are DISABLED...
-    close(clientfd);
-    clients[n]=-1;
+    // Closing SOCKET
+    shutdown(clientSocket, SD_BOTH);
+    closesocket(clientSocket);
+    return 0;
 }
